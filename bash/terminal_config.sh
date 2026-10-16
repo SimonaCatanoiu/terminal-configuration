@@ -2,53 +2,63 @@
 
 # This script installs bash-autosuggestions, kubectl, krew, kube-ps1, and sets up a clean bash environment.
 
-# Backup current bashrc
-cp ~/.bashrc ~/.bashrc.bak
+set -euo pipefail
 
-# Function to install a package if it's not already installed
-install_if_missing() {
-    local package=$1
-    if ! command -v "$package" &>/dev/null; then
-        echo "Installing $package..."
-        "$2"
-    else
-        echo "$package is already installed."
+# Install tools for the current user, without requiring root.
+export PATH="$HOME/.local/bin:${KREW_ROOT:-$HOME/.krew}/bin:$PATH"
+for dependency in curl tar git; do
+    if ! command -v "$dependency" >/dev/null 2>&1; then
+        echo "Required command not found: $dependency" >&2
+        exit 1
     fi
-}
+done
 
-# Install kubectl if not installed
-install_if_missing kubectl "curl -LO https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/$(uname | tr '[:upper:]' '[:lower:]')/amd64/kubectl && chmod +x kubectl && mv kubectl /usr/local/bin"
+OS="$(uname | tr '[:upper:]' '[:lower:]')"
+case "$(uname -m)" in
+    x86_64) ARCH=amd64 ;;
+    aarch64|arm64) ARCH=arm64 ;;
+    *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
 
-# Install krew if not installed
-if ! command -v kubectl-krew &>/dev/null; then
-    echo "Installing krew manually..."
-    (
-        set -x
-        cd "$(mktemp -d)" &&
-        OS="$(uname | tr '[:upper:]' '[:lower:]')" &&
-        ARCH="$(uname -m | sed -e 's/x86_64/amd64/' -e 's/\(arm\)\(64\)\?.*/\1\2/' -e 's/aarch64$/arm64/')" &&
-        KREW="krew-${OS}_${ARCH}" &&
-        curl -fsSLO "https://github.com/kubernetes-sigs/krew/releases/latest/download/${KREW}.tar.gz" &&
-        tar zxvf "${KREW}.tar.gz" &&
-        ./"${KREW}" install krew
-    )
-else
-    echo "krew is already installed."
+work_dir="$(mktemp -d)"
+trap 'rm -rf -- "$work_dir"' EXIT
+
+if ! command -v kubectl >/dev/null 2>&1; then
+    echo "Installing kubectl..."
+    version="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+    curl -fsSL "https://dl.k8s.io/release/${version}/bin/${OS}/${ARCH}/kubectl" -o "$work_dir/kubectl"
+    mkdir -p "$HOME/.local/bin"
+    install -m 0755 "$work_dir/kubectl" "$HOME/.local/bin/kubectl"
 fi
 
-# Install kube-ps1 if not installed
-install_if_missing kube-ps1 "curl -fsSL https://github.com/PSVant/kube-ps1/releases/latest/download/kube-ps1.sh -o ~/.kube-ps1.sh"
+if ! command -v kubectl-krew >/dev/null 2>&1; then
+    echo "Installing krew..."
+    KREW="krew-${OS}_${ARCH}"
+    curl -fsSL "https://github.com/kubernetes-sigs/krew/releases/latest/download/${KREW}.tar.gz" -o "$work_dir/krew.tar.gz"
+    tar -xzf "$work_dir/krew.tar.gz" -C "$work_dir"
+    "$work_dir/$KREW" install krew
+fi
+
+if [ ! -s "$HOME/.kube-ps1.sh" ]; then
+    echo "Installing kube-ps1..."
+    curl -fsSL https://raw.githubusercontent.com/jonmosco/kube-ps1/master/kube-ps1.sh -o "$work_dir/kube-ps1.sh"
+    install -m 0644 "$work_dir/kube-ps1.sh" "$HOME/.kube-ps1.sh"
+fi
+
+# Keep a backup before changing shell configuration.
+if [ -f "$HOME/.bashrc" ]; then
+    cp "$HOME/.bashrc" "$HOME/.bashrc.bak"
+fi
 
 # Update .bashrc with required configurations
 echo "Configuring bash..."
 
-cat <<'EOL' >> ~/.bashrc
+if ! grep -q '^# BEGIN terminal_config$' "$HOME/.bashrc" 2>/dev/null; then
+cat <<'EOL' >> "$HOME/.bashrc"
+# BEGIN terminal_config
 
 # Add krew bin to PATH
-export PATH="${KREW_ROOT:-$HOME/.krew}/bin:$PATH"
-
-# Add kubectl and kube-ps1 to PATH
-export PATH="$HOME/.krew/bin:$PATH"
+export PATH="$HOME/.local/bin:${KREW_ROOT:-$HOME/.krew}/bin:$PATH"
 
 # Enable bash-completion
 if [ -f /usr/local/share/bash-completion/bash_completion ]; then
@@ -67,8 +77,8 @@ alias h="history"
 #Search in history with up and down arrow keys
 bind '"\e[A": history-search-backward'
 bind '"\e[B": history-search-forward'
-bind "\e[C": forward-char
-bind "\e[D": backward-char
+bind '"\e[C": forward-char'
+bind '"\e[D": backward-char'
 
 #TAB completion features
 bind '"\t":menu-complete'
@@ -97,10 +107,16 @@ alias grep="grep $color_param"
 alias egrep="egrep $color_param"
 
 # Autocomplete settings for kubectl
-source <(kubectl completion bash)
+if command -v kubectl >/dev/null 2>&1; then
+    source <(kubectl completion bash)
+    complete -o default -F __start_kubectl k
+fi
 
 # Set up kube-ps1 for Kubernetes context in prompt
-PS1='$(source ~/.kube-ps1.sh; kube_ps1) \w \$ '
+if [ -f "$HOME/.kube-ps1.sh" ]; then
+    source "$HOME/.kube-ps1.sh"
+    PS1='$(kube_ps1) \w \$ '
+fi
 
 # Function to display current Git branch in the prompt
 getBranch() {
@@ -112,13 +128,13 @@ getBranch() {
 
 # Include Git branch in the prompt
 export PS1="$PS1 \$(getBranch) "
+# END terminal_config
 EOL
-
-# Reload .bashrc to apply changes immediately
-echo "Reloading .bashrc..."
-source ~/.bashrc
+fi
 
 # Verify installation
 echo "Verifying installation..."
 kubectl version --client
 kubectl krew version
+# An executed script cannot change its parent shell.
+echo 'Installation complete. Run: source ~/.bashrc'
